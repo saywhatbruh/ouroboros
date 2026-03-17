@@ -27,10 +27,13 @@ Example:
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import json
+import platform
 import re
+import subprocess
 from typing import TYPE_CHECKING, Any
 
 import anyio
@@ -57,6 +60,53 @@ log = get_logger(__name__)
 MAX_DECOMPOSITION_DEPTH = 2
 MIN_SUB_ACS = 2
 MAX_SUB_ACS = 5
+
+# Memory-pressure gate constants
+_MIN_FREE_MEMORY_GB = 2.0
+_MEMORY_CHECK_INTERVAL_SECONDS = 5.0
+_MEMORY_WAIT_MAX_SECONDS = 120.0
+
+
+def _get_available_memory_gb() -> float | None:
+    """Get available memory in GB. Returns None if check fails."""
+    system = platform.system()
+    try:
+        if system == "Darwin":
+            result = subprocess.run(
+                ["vm_stat"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode != 0:
+                return None
+            pages_free = 0
+            pages_inactive = 0
+            page_size = 4096  # macOS default
+            for line in result.stdout.splitlines():
+                if "page size of" in line:
+                    parts = line.split()
+                    for part in parts:
+                        if part.isdigit():
+                            page_size = int(part)
+                elif line.startswith("Pages free:"):
+                    pages_free = int(line.split(":")[1].strip().rstrip("."))
+                elif line.startswith("Pages inactive:"):
+                    pages_inactive = int(line.split(":")[1].strip().rstrip("."))
+            return (pages_free + pages_inactive) * page_size / (1024**3)
+
+        elif system == "Linux":
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        kb = int(line.split()[1])
+                        return kb / (1024**2)
+            return None
+
+        else:
+            return None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
 
 
 # =============================================================================
@@ -579,8 +629,8 @@ class ParallelACExecutor:
                         status="pending",
                     )
 
-                # Execute Sub-ACs in parallel
-                sub_results = await self._execute_sub_acs_parallel(
+                # Execute Sub-ACs sequentially (memory optimization)
+                sub_results = await self._execute_sub_acs(
                     parent_ac_index=ac_index,
                     sub_acs=sub_acs,
                     session_id=session_id,
@@ -724,7 +774,7 @@ Respond with either "ATOMIC" or the JSON array only, nothing else.
             )
             return None
 
-    async def _execute_sub_acs_parallel(
+    async def _execute_sub_acs(
         self,
         parent_ac_index: int,
         sub_acs: list[str],
@@ -736,23 +786,17 @@ Respond with either "ATOMIC" or the JSON array only, nothing else.
         execution_id: str,
         level_contexts: list[LevelContext] | None = None,
     ) -> list[ACExecutionResult]:
-        """Execute Sub-ACs in parallel, each in its own Claude session.
+        """Execute Sub-ACs sequentially to limit memory usage.
 
         Returns:
             List of ACExecutionResult for each Sub-AC.
         """
-        self._console.print(f"    [green]Starting {len(sub_acs)} Sub-ACs in parallel...[/green]")
+        self._console.print(f"    [green]Starting {len(sub_acs)} Sub-ACs sequentially...[/green]")
 
-        # Execute all Sub-ACs in parallel using anyio task group
-        # (preserves cancel scope context for SDK calls)
         sub_results: list[ACExecutionResult | BaseException] = [None] * len(sub_acs)
 
-        async def _run_sub_ac(idx: int, sub_ac: str) -> None:
-            # NOTE: No semaphore here — the parent AC already holds a slot.
-            # Acquiring the same semaphore would deadlock when all AC slots
-            # are occupied (parent waits for Sub-ACs, Sub-ACs wait for slots).
+        for idx, sub_ac in enumerate(sub_acs):
             try:
-                # Mark Sub-AC as executing before starting
                 await self._emit_subtask_event(
                     execution_id=execution_id,
                     ac_index=parent_ac_index,
@@ -779,10 +823,6 @@ Respond with either "ATOMIC" or the JSON array only, nothing else.
                 if isinstance(e, anyio.get_cancelled_exc_class()):
                     raise
                 sub_results[idx] = e
-
-        async with anyio.create_task_group() as tg:
-            for i, sub_ac in enumerate(sub_acs):
-                tg.start_soon(_run_sub_ac, i, sub_ac)
 
         # Convert exceptions to failed results
         final_results: list[ACExecutionResult] = []
@@ -826,6 +866,22 @@ Respond with either "ATOMIC" or the JSON array only, nothing else.
         if detail and len(detail) > 60:
             detail = detail[:57] + "..."
         return f"{tool_name}: {detail}" if detail else tool_name
+
+    async def _wait_for_memory(self, label: str) -> None:
+        """Block until system has enough free memory to spawn a subprocess."""
+        elapsed = 0.0
+        while elapsed < _MEMORY_WAIT_MAX_SECONDS:
+            available_gb = _get_available_memory_gb()
+            if available_gb is None or available_gb >= _MIN_FREE_MEMORY_GB:
+                return
+            log.warning(
+                "memory_pressure.waiting",
+                available_gb=round(available_gb, 2),
+                label=label,
+            )
+            await asyncio.sleep(_MEMORY_CHECK_INTERVAL_SECONDS)
+            elapsed += _MEMORY_CHECK_INTERVAL_SECONDS
+        log.warning("memory_pressure.timeout", label=label)
 
     async def _execute_atomic_ac(
         self,
@@ -908,6 +964,8 @@ When complete, explicitly state: [TASK_COMPLETE]
         messages: list[AgentMessage] = []
         final_message = ""
         success = False
+
+        await self._wait_for_memory(label)
 
         try:
             async for message in self._adapter.execute_task(
